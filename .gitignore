@@ -1,0 +1,14 @@
+# Untracked local clone of upstream lucebox (fetched fresh in CI instead)
+/lucebox/
+
+# Stray mitmproxy capture DB
+mitm_mcp_traffic.db
+
+__pycache__/
+*.pyc
+
+# Local build/test scratch
+build*/
+dist/
+*.zip
+*.tar.gz

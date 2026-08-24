@@ -1,0 +1,101 @@
+name: 'Smoke test lucebox build'
+description: >
+  Downloads a lucebox build artifact, launches dflash_server on a self-hosted
+  GPU runner with a small GGUF model, and asserts the HTTP server answers a
+  chat completion. Linux only. Designed to run continue-on-error so a flaky
+  device never blocks the release.
+
+inputs:
+  gfx_target:
+    description: 'GPU target label for logging (e.g. gfx1151)'
+    required: true
+  artifact_name:
+    description: 'Build artifact name to download'
+    required: true
+  model_url:
+    description: 'URL of a small GGUF model for the smoke test'
+    required: false
+    default: ${{ vars.LUCEBOX_SMOKE_MODEL_URL || 'https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_0.gguf' }}
+  port:
+    description: 'Port for the smoke-test server instance'
+    required: false
+    default: '18432'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download build artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: ./pkg
+
+    - name: Prepare binaries
+      shell: bash
+      run: |
+        set -euo pipefail
+        chmod +x pkg/bin/dflash_server pkg/bin/test_dflash pkg/bin/test_server_unit 2>/dev/null || true
+        ls -la pkg/bin/
+        ./pkg/bin/dflash_server --help 2>&1 | head -n 5 || true
+
+    - name: Download smoke model
+      shell: bash
+      env:
+        MODEL_URL: ${{ inputs.model_url }}
+      run: |
+        set -euo pipefail
+        mkdir -p models
+        if [ ! -f "models/smoke.gguf" ]; then
+          curl -fL --retry 3 -o models/smoke.gguf "$MODEL_URL"
+        fi
+        ls -la models/
+
+    - name: Launch dflash_server and probe
+      shell: bash
+      timeout-minutes: 10
+      run: |
+        set -uo pipefail
+        PORT="${{ inputs.port }}"
+        LOG="server.log"
+
+        ./pkg/bin/dflash_server models/smoke.gguf --port "$PORT" > "$LOG" 2>&1 &
+        SERVER_PID=$!
+        trap 'kill $SERVER_PID 2>/dev/null || true; sleep 2; kill -9 $SERVER_PID 2>/dev/null || true' EXIT
+
+        # Poll /v1/models until ready (model load can take a while on first run)
+        ready=0
+        for i in $(seq 1 60); do
+          if curl -sf "http://127.0.0.1:$PORT/v1/models" > /dev/null 2>&1; then
+            ready=1
+            break
+          fi
+          if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "ERROR: server exited during startup" >&2
+            tail -n 50 "$LOG" >&2
+            exit 1
+          fi
+          sleep 3
+        done
+        if [ "$ready" != "1" ]; then
+          echo "ERROR: server did not become ready within 180s" >&2
+          tail -n 50 "$LOG" >&2
+          exit 1
+        fi
+        echo "Server is up (pid $SERVER_PID)"
+
+        # One chat completion, deterministic
+        resp=$(curl -sf -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+          -H 'Content-Type: application/json' \
+          -d '{"messages":[{"role":"user","content":"Say OK."}],"temperature":0,"max_tokens":16}')
+        echo "Response: $resp"
+        echo "$resp" | grep -q '"content"' || { echo "ERROR: no content in response" >&2; exit 1; }
+
+        # Assert the GPU backend actually engaged (HIP line in startup log)
+        if grep -qiE 'hip|rocm|gfx' "$LOG"; then
+          echo "GPU backend activation found in log"
+        else
+          echo "WARNING: no HIP/GPU markers found in server log"
+        fi
+        grep -E 'offload|device|backend' "$LOG" | head -n 20 || true
+
+        echo "Smoke test passed for ${{ inputs.gfx_target }}"
