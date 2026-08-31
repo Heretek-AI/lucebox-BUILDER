@@ -1,55 +1,93 @@
-# lucebox-BUILDER
+# lucebox-BUILDER (CUDA 12 & AMD ROCm™ 7)
 
-Nightly binary builds of [lucebox](https://github.com/Luce-Org/lucebox) for every supported GPU platform, attached to GitHub Releases with sequential `b####` tags. Modeled on the [ROCmFPX-BUILDER](https://github.com/Heretek-AI/ROCmFPX-BUILDER) pattern.
+<div align="center">
 
-## What each nightly contains
+[![Latest Release](https://img.shields.io/github/v/release/Heretek-AI/lucebox-BUILDER?logo=github&logoColor=white)](https://github.com/Heretek-AI/lucebox-BUILDER/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/Heretek-AI/lucebox-BUILDER?logo=opensourceinitiative&logoColor=white&cacheBust=1)](LICENSE)
+[![CUDA 12.8](https://img.shields.io/badge/CUDA-12.8-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
+[![AMD ROCm 7.0](https://img.shields.io/badge/ROCm-7.0-blue?logo=amd&logoColor=white)](https://github.com/ROCm/ROCm)
+[![Platforms](https://img.shields.io/badge/OS-Linux%20x86__64-E95420?logo=linux&logoColor=white)](#-supported-devices)
+[![GPU Targets](https://img.shields.io/badge/GPU-CUDA%20%7C%20Strix%20Halo%20%7C%20RDNA3%20%7C%20RDNA4-00B04F?logo=amd&logoColor=white)](#-supported-devices)
 
-Every release ships Linux x86_64 zips; ROCm archives bundle all required runtime libraries with `$ORIGIN` rpath — **unpack anywhere and run**, no `LD_LIBRARY_PATH` or system ROCm install needed (the host GPU driver is still required at runtime).
+<p align="center">
+  <b>High-performance automated nightly and on-demand builds of <a href="https://github.com/Luce-Org/lucebox">lucebox</a> (DFlash inference server) with built-in CUDA 12.8 & AMD ROCm™ 7 runtime libraries.</b>
+</p>
 
-| Asset | Backend | Covers |
-|---|---|---|
-| `lucebox-b####-linux-cuda12-x64.zip` | CUDA 12.8 fat binary | sm_75 / sm_80 / sm_86 / sm_89 / sm_90 / sm_120 (2080 Ti → RTX 5090) |
-| `lucebox-b####-linux-rocm-gfx1151-x64.zip` | HIP | Strix Halo / Ryzen AI MAX+ 395 — host ROCm ≥ 6.4.1 |
-| `lucebox-b####-linux-rocm-gfx1100-x64.zip` | HIP | Radeon RX 7900 XTX / RDNA3 |
-| `lucebox-b####-linux-rocm-gfx1201-x64.zip` | HIP | Radeon AI PRO R9700 / RDNA4 |
+</div>
 
-## Usage
+---
 
-```bash
-unzip lucebox-b1000-linux-cuda12-x64.zip -d lucebox && cd lucebox/bin
-./dflash_server /path/to/model.gguf --port 8080
-# optional speculative decoding:
-./dflash_server model.gguf --draft draft.gguf --port 8080
+## ⚡ Project Overview
+
+**lucebox** ([`Luce-Org/lucebox`](https://github.com/Luce-Org/lucebox)) is a high-performance inference engine for **DeepSeek-V4, DeepSeek-V3, and DFlash architectures**, featuring flash-prefill, speculative decoding, continuous batching, and low-latency KV cache management.
+
+This repository (`Heretek-AI/lucebox-BUILDER`) delivers turnkey, relocatable binary releases with embedded runtime libraries and `$ORIGIN` RPATHs — **zero host CUDA/ROCm installations required**.
+
+```mermaid
+flowchart LR
+    subgraph Toolchains ["Multi-Backend Toolchains"]
+        C1["NVIDIA CUDA 12.8<br/>Fat Binary (sm_75 - sm_120)"]
+        C2["AMD ROCm 7 Nightlies (TheRock)<br/>(gfx1151, gfx1100, gfx1201)"]
+    end
+
+    subgraph Builder ["lucebox-BUILDER Pipeline"]
+        B1["Automated Nightly CI (13:00 UTC)"]
+        B2["$ORIGIN RPATH Dynamic Bundler"]
+        B3["Non-Blocking Hardware Smoke Tests"]
+    end
+
+    subgraph Releases ["Turnkey Binary Releases"]
+        R1["lucebox-b####-linux-cuda12-x64.zip"]
+        R2["lucebox-b####-linux-rocm-gfx1151-x64.zip"]
+        R3["lucebox-b####-linux-rocm-gfx1100-x64.zip"]
+        R4["lucebox-b####-linux-rocm-gfx1201-x64.zip"]
+    end
+
+    Toolchains --> Builder --> Releases
 ```
 
-## Workflow
+---
 
-`.github/workflows/build-lucebox.yml`:
+## 🎯 Supported Hardware Matrix
 
-- **Nightly cron** at 13:00 UTC, plus manual `workflow_dispatch` (overridable CUDA arches, gfx targets, ROCm version, lucebox ref, optional rocWMMA Phase-2 kernels and CPU unit tests) and PR builds (no release).
-- HIP toolchains come from AMD's [TheRock](https://rocm.nightlies.amd.com/tarball-multi-arch/) dist tarballs (`latest` auto-detects the newest published version per dist prefix; TheRock publishes RDNA3/RDNA4 only as family dists `gfx110X-all` / `gfx120X-all`, so those prefixes back the gfx1100/gfx1201 builds — the compiled binaries themselves stay single-gfx). CUDA builds use nvcc 12.8 via the Jimver action.
-- Non-blocking GPU smoke tests run on self-hosted runners when configured (see below); a flaky device never blocks a release.
+Every release ships Linux x86_64 zip packages. ROCm archives bundle all essential shared libraries (`libamdhip64`, `librocblas`, `libhipblas`, `libhipblaslt`, `.kpack`, Tensile blobs) with `$ORIGIN` RPATH:
 
-### Self-hosted smoke-test configuration
+| Asset Name | Backend | Target Architecture & Devices |
+|---|---|---|
+| `lucebox-${TAG}-linux-cuda12-x64.zip` | **CUDA 12.8 Fatbin** | `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`, `sm_120` (RTX 2080 Ti → RTX 3090 / 4090 / 5090, A100, H100) |
+| `lucebox-${TAG}-linux-rocm-gfx1151-x64.zip` | **AMD HIP / ROCm 7** | **AMD Strix Halo APU** (Ryzen AI MAX+ Pro 395 / Radeon 8060S / 128GB Unified Memory) |
+| `lucebox-${TAG}-linux-rocm-gfx1100-x64.zip` | **AMD HIP / ROCm 7** | **AMD RDNA3 Discrete GPUs** (Radeon RX 7900 XTX / 7900 XT / 7800 XT) |
+| `lucebox-${TAG}-linux-rocm-gfx1201-x64.zip` | **AMD HIP / ROCm 7** | **AMD RDNA4 Discrete GPUs** (Radeon AI PRO R9700, RX 9070 XT / 9070) |
 
-Set these **repository variables** to enable GPU smoke tests (JSON arrays of runner labels):
+---
 
-| Variable | Example |
-|---|---|
-| `LUCEBOX_RUNNERS_GFX1151` | `["stx-halo", "Linux"]` |
-| `LUCEBOX_RUNNERS_GFX1201` | `["r9700", "Linux"]` |
-| `LUCEBOX_RUNNERS_CUDA` | `["rtx3090", "Linux"]` |
-| `LUCEBOX_RUNNERS_GFX1100` | unset → skipped |
+## 📦 Quick Start
 
-Targets without a configured variable get no smoke leg at all (no job is created, rather than one stuck waiting for a runner).
+```bash
+# 1. Download and extract target archive from GitHub Releases
+unzip lucebox-b1000-linux-rocm-gfx1151-x64.zip -d lucebox
+cd lucebox/bin
 
-Optionally set `LUCEBOX_SMOKE_MODEL_URL` to override the smoke GGUF.
+# 2. Launch DFlash inference server
+./dflash_server /path/to/DeepSeek-V4-Flash.gguf --port 8080 --host 0.0.0.0
 
-## Scope exclusions
+# 3. Speculative decoding with draft model
+./dflash_server main_model.gguf --draft draft_model.gguf --port 8080
+```
 
-- Windows builds (upstream CI covers compile-only on Windows today).
-- The megakernel PyTorch extension (`optimizations/megakernel`) — Python extension built against torch cu128 wheels; use upstream docker images or build locally.
-- GB10 `sm_121` (needs CUDA ≥ 12.9), Jetson Thor `sm_110` (CUDA ≥ 13, ARM64) — future extensions.
-- Pre-Turing NVIDIA arches (< sm_75): excluded by upstream by design.
-- `gfx942` (MI300X) / `gfx90a` (MI200): listed in upstream Dockerfile but untested upstream; not in the matrix.
-- `gfx1200`: allowed as a dispatch-input experiment but untested upstream.
+---
+
+## 🚀 CI Workflows
+
+[`.github/workflows/build-lucebox.yml`](.github/workflows/build-lucebox.yml):
+- **Nightly cron** at 13:00 UTC, plus manual `workflow_dispatch` (configurable CUDA arches, gfx targets, ROCm version, and rocWMMA Phase-2 kernels).
+- **TheRock ROCm Toolchain**: Downloads nightly multi-arch tarballs from AMD's official distribution mirrors.
+- **CUDA 12.8 Toolchain**: Builds fat binaries covering compute capabilities from Turing (`sm_75`) through Blackwell (`sm_120`).
+- **Self-Hosted Smoke Tests**: Non-blocking verification on live GPU hardware.
+
+---
+
+## 📄 License & Attribution
+
+- **lucebox**: Developed by Luce Org ([Luce-Org/lucebox](https://github.com/Luce-Org/lucebox)) under the MIT License.
+- **lucebox-BUILDER Pipeline**: Developed by Heretek-AI under the MIT License.
