@@ -19,13 +19,23 @@ export LD_LIBRARY_PATH=/tmp/cuda-stubs:$LD_LIBRARY_PATH
 cmake -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+  -DDFLASH27B_USER_CUDA_ARCHITECTURES="75;80;86;89;90;120" \
   -DCMAKE_CUDA_ARCHITECTURES="75;80;86;89;90;120" \
   -DDFLASH27B_ENABLE_BSA=OFF \
   -DDFLASH27B_FA_ALL_QUANTS=OFF
 cmake --build build --target test_dflash dflash_server test_server_unit -j$(nproc)
 ```
 
-Binaries land in `build/bin` (`dflash_server`, `test_dflash`, `test_server_unit`, `share/status.html`). To enable BSA speculative-prefill, init the submodule and drop `-DDFLASH27B_ENABLE_BSA=OFF`:
+**Both arch flags are required**: `server/CMakeLists.txt` force-overwrites
+`CMAKE_CUDA_ARCHITECTURES` with its own auto-resolved list (`70;75;86` plus
+`120` on nvcc ≥ 12.8) unless `DFLASH27B_USER_CUDA_ARCHITECTURES` is also set —
+passing only one silently drops sm_80/89/90 from the fat binary.
+
+Executables and the ggml shared libs land **flat in `build/`** (upstream sets
+`CMAKE_RUNTIME_OUTPUT_DIRECTORY` to the build root so ggml libs load), i.e.
+`build/dflash_server`, `build/test_dflash`, `build/test_server_unit`,
+`build/share/status.html`, `build/**/libggml*.so*`. To enable BSA
+speculative-prefill, init the submodule and drop `-DDFLASH27B_ENABLE_BSA=OFF`:
 
 ```bash
 cd .. && git submodule update --init --depth 1 server/deps/Block-Sparse-Attention && cd server
@@ -38,6 +48,16 @@ BSA requires all target arches ≥ sm_80.
 Requires a ROCm install with hipblas, rocblas, rocprim, hipcub headers.
 
 ### Option A — TheRock dist tarball (same as CI)
+
+Chip → dist prefix mapping (TheRock publishes single-chip dists only for
+gfx115x; RDNA3/RDNA4 come from family dists):
+
+| gfx chip | TheRock prefix |
+|---|---|
+| gfx1151 | `gfx1151` |
+| gfx1100 | `gfx110X-all` |
+| gfx1201 | `gfx120X-all` |
+| gfx1200 | `gfx120X-all` |
 
 ```bash
 # Pick your target; version example shown, or scrape the index for latest:
@@ -66,9 +86,11 @@ cmake -B build -G Ninja \
 cmake --build build --target test_dflash dflash_server test_server_unit -j$(nproc)
 ```
 
-### Option B — distro ROCm via apt (needed for rocwmma Phase-2 kernels)
+### Option B — distro ROCm via apt
 
-TheRock nightly tarballs may not ship `rocwmma` headers; the apt repo does:
+Current TheRock dists bundle `rocwmma` headers (`include/rocwmma/`), so
+`-DDFLASH27B_HIP_SM80_EQUIV=ON` works straight off Option A. Use this route
+only for a pinned distro ROCm (e.g. ROCm 6.4.1 to match an older host driver):
 
 ```bash
 sudo apt-get install -y hipblas-dev hipcub-dev rocblas-dev rocprim-dev rocwmma-dev libcurl4-openssl-dev
@@ -81,18 +103,25 @@ cmake -B build -G Ninja \
 
 ### Runtime bundling for portable zips
 
+Mirror of CI's `dist/` staging (`dist/bin` + sibling `.kpack`):
+
 ```bash
-cd build/bin
+mkdir -p dist/bin/share dist/bin/rocblas/library dist/kpacks
+cp build/dflash_server build/test_dflash build/test_server_unit dist/bin/
+cp build/share/status.html dist/bin/share/ 2>/dev/null || true
+find build -name 'libggml*.so*' -exec cp -L {} dist/bin/ \;
 for f in /opt/rocm/lib/libhipblas.so* /opt/rocm/lib/librocblas.so* \
          /opt/rocm/lib/libamdhip64.so* /opt/rocm/lib/libhsa-runtime64.so* \
-         /opt/rocm/lib/libamd_comgr*.so* /opt/rocm/lib/librocprofiler-register.so*; do
-  cp $f . 2>/dev/null || true
+         /opt/rocm/lib/libamd_comgr*.so* /opt/rocm/lib/librocprofiler-register.so* \
+         /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_*.so*; do
+  cp -L $f dist/bin/ 2>/dev/null || true
 done
-cp -r /opt/rocm/lib/rocblas/library rocblas/library 2>/dev/null || true
+cp -r /opt/rocm/lib/rocblas/library/. dist/bin/rocblas/library/ 2>/dev/null || true
+cp /opt/rocm/.kpack/*_<your-gfx>.kpack dist/kpacks/ 2>/dev/null || true   # renamed to .kpack/ beside bin/ before zipping
 # catch-all: copy whatever else the loader complains about
-python3 utils/gather_required_libs.py --dest-dir "$(pwd)" --binary dflash_server
-for file in *.so* dflash_server test_dflash test_server_unit; do
-  [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file"
+python3 utils/gather_required_libs.py --dest-dir dist/bin --binary dflash_server
+cd dist/bin && for f in *; do
+  [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f"
 done
 ```
 

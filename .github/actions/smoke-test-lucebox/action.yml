@@ -5,6 +5,12 @@ description: >
   chat completion. Linux only. Designed to run continue-on-error so a flaky
   device never blocks the release.
 
+# Runner notes: this action assumes one label per GPU (one job at a time on
+# each runner). If you must share a multi-GPU box between two targets (like
+# upstream's gfx1201+gfx1151 machine), pin the device per runner via the
+# HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES env in the RUNNER's service
+# configuration — not from the workflow, which cannot know the box layout.
+
 inputs:
   gfx_target:
     description: 'GPU target label for logging (e.g. gfx1151)'
@@ -90,11 +96,18 @@ runs:
         echo "Response: $resp"
         echo "$resp" | grep -q '"content"' || { echo "ERROR: no content in response" >&2; exit 1; }
 
-        # Assert the GPU backend actually engaged (HIP line in startup log)
-        if grep -qiE 'hip|rocm|gfx' "$LOG"; then
-          echo "GPU backend activation found in log"
+        # Assert the GPU backend actually engaged. Marker set depends on the
+        # artifact under test: HIP logs mention hip/rocm/gfx, CUDA logs
+        # mention cuda/CUDA/device names.
+        if [ "${{ inputs.gfx_target }}" = "cuda" ]; then
+          marker_re='cuda|CUDA|cuInit|sm_[0-9]+'
         else
-          echo "WARNING: no HIP/GPU markers found in server log"
+          marker_re='hip|rocm|gfx'
+        fi
+        if grep -qiE "$marker_re" "$LOG"; then
+          echo "GPU backend activation found in log (${{ inputs.gfx_target }})"
+        else
+          echo "WARNING: no GPU backend markers found in server log"
         fi
         grep -E 'offload|device|backend' "$LOG" | head -n 20 || true
 

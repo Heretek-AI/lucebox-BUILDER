@@ -27,7 +27,7 @@ unzip lucebox-b1000-linux-cuda12-x64.zip -d lucebox && cd lucebox/bin
 `.github/workflows/build-lucebox.yml`:
 
 - **Nightly cron** at 13:00 UTC, plus manual `workflow_dispatch` (overridable CUDA arches, gfx targets, ROCm version, lucebox ref, optional rocWMMA Phase-2 kernels and CPU unit tests) and PR builds (no release).
-- HIP toolchains come from AMD's [TheRock](https://rocm.nightlies.amd.com/tarball-multi-arch/) dist tarballs (`latest` auto-detects the newest published version per gfx target). CUDA builds use nvcc 12.8 via the Jimver action.
+- HIP toolchains come from AMD's [TheRock](https://rocm.nightlies.amd.com/tarball-multi-arch/) dist tarballs (`latest` auto-detects the newest published version per dist prefix; TheRock publishes RDNA3/RDNA4 only as family dists `gfx110X-all` / `gfx120X-all`, so those prefixes back the gfx1100/gfx1201 builds — the compiled binaries themselves stay single-gfx). CUDA builds use nvcc 12.8 via the Jimver action.
 - Non-blocking GPU smoke tests run on self-hosted runners when configured (see below); a flaky device never blocks a release.
 
 ### Self-hosted smoke-test configuration
@@ -38,7 +38,10 @@ Set these **repository variables** to enable GPU smoke tests (JSON arrays of run
 |---|---|
 | `LUCEBOX_RUNNERS_GFX1151` | `["stx-halo", "Linux"]` |
 | `LUCEBOX_RUNNERS_GFX1201` | `["r9700", "Linux"]` |
+| `LUCEBOX_RUNNERS_CUDA` | `["rtx3090", "Linux"]` |
 | `LUCEBOX_RUNNERS_GFX1100` | unset → skipped |
+
+Targets without a configured variable get no smoke leg at all (no job is created, rather than one stuck waiting for a runner).
 
 Optionally set `LUCEBOX_SMOKE_MODEL_URL` to override the smoke GGUF.
 

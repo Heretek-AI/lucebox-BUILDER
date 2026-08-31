@@ -12,7 +12,7 @@ on:
         required: false
         default: 'gfx1151,gfx1100,gfx1201'
       rocm_version:
-        description: 'ROCm version to use (e.g., 7.2.2) or "latest" to auto-detect'
+        description: 'ROCm version to use (e.g., 7.15.0a20260728) or "latest" to auto-detect'
         required: false
         default: 'latest'
       lucebox_version:
@@ -25,7 +25,7 @@ on:
         default: true
         type: boolean
       hip_sm80_equiv:
-        description: 'Enable rocWMMA Phase-2 flashprefill kernels (needs rocwmma in the ROCm dist)'
+        description: 'Enable rocWMMA Phase-2 flashprefill kernels (TheRock dists bundle rocwmma headers)'
         required: false
         default: false
         type: boolean
@@ -53,73 +53,169 @@ env:
   LUCEBOX_REPO_URL: https://github.com/Luce-Org/lucebox
 
 jobs:
+  # ──────────────────────────────────────────────────────────────────────
+  # prepare-matrix: validate targets, map chips -> TheRock dist prefixes,
+  # auto-detect ROCm versions once per distinct prefix, resolve the upstream
+  # commit hash, and derive the smoke-test matrix from repo variables.
+  # Centralizing nondeterministic values here keeps build/release jobs pure
+  # consumers (per-leg outputs would race when several legs finish).
+  # ──────────────────────────────────────────────────────────────────────
   prepare-matrix:
     runs-on: ubuntu-22.04
     outputs:
-      cuda_matrix: ${{ steps.set-matrix.outputs.cuda_matrix }}
       rocm_matrix: ${{ steps.set-matrix.outputs.rocm_matrix }}
-      should_build_cuda: ${{ steps.set-matrix.outputs.should_build_cuda }}
+      smoke_matrix: ${{ steps.set-matrix.outputs.smoke_matrix }}
       should_build_rocm: ${{ steps.set-matrix.outputs.should_build_rocm }}
+      versions_json: ${{ steps.detect.outputs.versions_json }}
+      lucebox_commit_hash: ${{ steps.upstream.outputs.hash }}
+    env:
+      RUNNERS_GFX1151: ${{ vars.LUCEBOX_RUNNERS_GFX1151 }}
+      RUNNERS_GFX1201: ${{ vars.LUCEBOX_RUNNERS_GFX1201 }}
+      RUNNERS_GFX1100: ${{ vars.LUCEBOX_RUNNERS_GFX1100 }}
+      RUNNERS_CUDA: ${{ vars.LUCEBOX_RUNNERS_CUDA }}
     steps:
-    - name: Set matrix
+    - name: Set matrices
       id: set-matrix
       env:
         GFX_TARGETS: ${{ env.GFX_TARGETS }}
       run: |
         set -euo pipefail
-        targets="${GFX_TARGETS}"
+        echo "Input gfx targets: ${GFX_TARGETS}"
 
-        echo "Input gfx targets: $targets"
+        # Chip -> TheRock tarball-multi-arch dist prefix. TheRock publishes
+        # single-chip dists only for gfx115x; RDNA3/RDNA4 ship as family
+        # dists (`gfx110X-all`, `gfx120X-all`). We compile against one chip
+        # regardless (-DDFLASH27B_HIP_ARCHITECTURES), so each shipped binary
+        # stays single-gfx even though its toolchain came from a family dist.
+        declare -A S3_PREFIX=(
+          [gfx1151]=gfx1151
+          [gfx1100]=gfx110X-all
+          [gfx1201]=gfx120X-all
+          [gfx1200]=gfx120X-all
+        )
 
-        # Validate against the supported allowlist (gfx1200 is listed by
-        # upstream but untested; allowed here so users can experiment).
         allowlist="gfx1151 gfx1100 gfx1201 gfx1200"
-        target_list=$(echo "$targets" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' || true)
+        target_list=$(echo "${GFX_TARGETS}" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' || true)
         if [ -z "$target_list" ]; then
           echo "No gfx targets requested" >&2
           exit 1
         fi
+
+        legs=()
+        prefixes=""
         for t in $target_list; do
           if ! echo " $allowlist " | grep -q " $t "; then
-            echo "Unsupported gfx target '$t'. Supported: $allowlist" >&2
+            echo "::error::Unsupported gfx target '$t'. Supported: $allowlist" >&2
             exit 1
           fi
+          p="${S3_PREFIX[$t]}"
+          legs+=("{\"backend\":\"hip\",\"gfx_target\":\"$t\",\"s3_target\":\"$p\"}")
+          case " $prefixes " in *" $p "*) ;; *) prefixes="$prefixes $p";; esac
         done
 
-        # One HIP matrix entry per gfx target (per-arch builds, not fat binaries)
-        gfx_array=$(echo "$target_list" | jq -R . | jq -s .)
-        rocm_matrix=$(echo "{\"include\": $(echo "$gfx_array" | jq -c '[.[] | {backend:"hip", gfx_target:.}]')}" | jq -c)
-        cuda_matrix='{"include":[{"backend":"cuda"}]}'
+        printf 'rocm_matrix=%s\n' "{\"include\":[$(IFS=,; echo "${legs[*]}")]}" >> "$GITHUB_OUTPUT"
+        echo "should_build_rocm=true" >> "$GITHUB_OUTPUT"
 
-        should_build_rocm="false"
-        should_build_cuda="true"
-
-        if [ "$(echo "$gfx_array" | jq length)" -gt 0 ]; then
-          should_build_rocm="true"
-          echo "rocm_matrix=$rocm_matrix" >> "$GITHUB_OUTPUT"
+        # Smoke matrix: only targets that both were requested AND have a
+        # runner-label repo variable configured. Jobs for unset variables
+        # simply never materialize (an empty/missing label would otherwise
+        # queue forever waiting for a nonexistent runner).
+        declare -A RUNNER_VAR=(
+          [gfx1151]="$RUNNERS_GFX1151"
+          [gfx1201]="$RUNNERS_GFX1201"
+          [gfx1100]="$RUNNERS_GFX1100"
+        )
+        smoke="[]"
+        for t in $target_list; do
+          labels="${RUNNER_VAR[$t]:-}"
+          [ -n "$labels" ] || continue
+          echo "$labels" | jq -e 'type == "array"' >/dev/null \
+            || { echo "::error::LUCEBOX_RUNNERS_${t^^} must be a JSON array of runner labels, got: $labels" >&2; exit 1; }
+          smoke=$(echo "$smoke" | jq -c --arg t "$t" --argjson l "$labels" '. + [{gfx_target:$t, runner_labels:$l}]')
+        done
+        if [ -n "${RUNNERS_CUDA:-}" ]; then
+          echo "$RUNNERS_CUDA" | jq -e 'type == "array"' >/dev/null \
+            || { echo "::error::LUCEBOX_RUNNERS_CUDA must be a JSON array of runner labels, got: $RUNNERS_CUDA" >&2; exit 1; }
+          smoke=$(echo "$smoke" | jq -c --argjson l "$RUNNERS_CUDA" '. + [{gfx_target:"cuda", runner_labels:$l}]')
         fi
-        echo "cuda_matrix=$cuda_matrix" >> "$GITHUB_OUTPUT"
+        echo "smoke_matrix=$smoke" >> "$GITHUB_OUTPUT"
 
-        echo "should_build_cuda=$should_build_cuda" >> "$GITHUB_OUTPUT"
-        echo "should_build_rocm=$should_build_rocm" >> "$GITHUB_OUTPUT"
+        echo "ROCm matrix: {\"include\":[${legs[*]:-}]}"
+        echo "Distinct TheRock prefixes:$prefixes"
+        echo "Smoke matrix: $smoke"
+        echo "prefixes=$prefixes" >> "$GITHUB_ENV"
 
-        echo "CUDA matrix: $cuda_matrix"
-        echo "ROCm matrix: $rocm_matrix"
+    - name: Detect ROCm versions
+      id: detect
+      env:
+        ROCM_VERSION: ${{ env.ROCM_VERSION }}
+      run: |
+        set -euo pipefail
+        # No ROCm legs requested (empty prefix list): emit an empty map so
+        # downstream consumers degrade gracefully.
+        if [ -z "${prefixes:-}" ]; then
+          echo "versions_json={}" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
+        versions_json="{"
+        for p in $prefixes; do
+          if [ "$ROCM_VERSION" = "latest" ]; then
+            files_json=$(curl -sf "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)') \
+              || { echo "::error::Failed to parse file index from $base_url/" >&2; exit 1; }
+            prefix="therock-dist-linux-${p}-"
+            latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" \
+              '[.[] | select(.name | test("^" + $p + "[0-9]+\\.[0-9]+\\.[0-9]+(a|rc)[0-9]+\\.tar\\.gz$"))] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
+            if [ -z "$latest_file" ]; then
+              echo "::error::No tarball found for prefix '$prefix' at $base_url/" >&2
+              exit 1
+            fi
+            if [[ "$latest_file" =~ therock-dist-linux-(.*)-([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+              detected="${BASH_REMATCH[2]}"
+            else
+              echo "::error::Failed to extract ROCm version from: $latest_file" >&2
+              exit 1
+            fi
+            echo "$p -> $detected ($latest_file)"
+          else
+            detected="$ROCM_VERSION"
+            echo "$p -> $detected (pinned)"
+          fi
+          versions_json="${versions_json}\"${p}\":\"${detected}\","
+        done
+        versions_json="${versions_json%,}}"
+        echo "versions_json=$versions_json" >> "$GITHUB_OUTPUT"
 
+    - name: Resolve upstream commit hash
+      id: upstream
+      env:
+        LUCEBOX_VERSION: ${{ env.LUCEBOX_VERSION }}
+        LUCEBOX_REPO_URL: ${{ env.LUCEBOX_REPO_URL }}
+      run: |
+        set -euo pipefail
+        v="$LUCEBOX_VERSION"
+        if [ "$v" = "latest" ] || [ "$v" = "main" ]; then
+          git clone --depth 1 --single-branch --branch main "$LUCEBOX_REPO_URL.git" src
+        else
+          git clone --depth 1 --single-branch --branch "$v" "$LUCEBOX_REPO_URL.git" src
+        fi
+        echo "hash=$(git -C src rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+        git -C src log --oneline -1
+
+  # ──────────────────────────────────────────────────────────────────────
+  # build-cuda: single fat-binary job (nvcc 12.8 covers sm_75..sm_120).
+  # NOTE: server/CMakeLists.txt force-overwrites CMAKE_CUDA_ARCHITECTURES
+  # from its own auto-resolved list unless DFLASH27B_USER_CUDA_ARCHITECTURES
+  # is also passed — both flags below are load-bearing.
+  # Binaries/libraries land flat in server/build/ (the project sets
+  # CMAKE_RUNTIME_OUTPUT_DIRECTORY to the build root), so we stage a dist/
+  # tree rather than uploading build/bin/.
+  # ──────────────────────────────────────────────────────────────────────
   build-cuda:
-    name: build-cuda (sm_${{ matrix.arches }})
+    name: build-cuda
     runs-on: ubuntu-22.04
     needs: prepare-matrix
-    if: needs.prepare-matrix.outputs.should_build_cuda == 'true'
     timeout-minutes: 120
-    strategy:
-      matrix:
-        include:
-          - arches: default
-      fail-fast: false
-    outputs:
-      cuda_version: ${{ steps.set-outputs.outputs.cuda_version }}
-      lucebox_commit_hash: ${{ steps.set-outputs.outputs.lucebox_commit_hash }}
 
     steps:
     - name: Checkout repository
@@ -145,10 +241,10 @@ jobs:
         non-cuda-sub-packages: '["libcublas-dev"]'
 
     - name: Provide CUDA driver stub for linking
-      # nvidia/cuda:*-devel images ship the driver stub as libcuda.so but not
-      # libcuda.so.1; without this symlink the test_dflash link step fails with
-      # `undefined reference to cuMem*` (see upstream Dockerfile). At runtime
-      # the host driver provides the real libcuda.so.1.
+      # nvidia/cuda:*-devel images and the network-installed toolkit ship the
+      # driver stub as libcuda.so but not libcuda.so.1; without the symlink
+      # the dflash link step fails with `undefined reference to cuMem*`.
+      # At runtime the host driver provides the real libcuda.so.1.
       run: |
         mkdir -p "$RUNNER_TEMP/cuda-stubs"
         ln -sf "$CUDA_PATH/targets/x86_64-linux/lib/stubs/libcuda.so" \
@@ -167,8 +263,6 @@ jobs:
           git clone --depth 1 --single-branch --branch "$version" "${{ env.LUCEBOX_REPO_URL }}.git"
         fi
         cd lucebox
-        commit_hash=$(git rev-parse --short=7 HEAD)
-        echo "LUCEBOX_COMMIT_HASH=$commit_hash" >> "$GITHUB_ENV"
         git log --oneline -1
         # BSA is disabled for these builds, but assert the vendored ggml is intact.
         test -f server/deps/llama.cpp/ggml/CMakeLists.txt \
@@ -181,6 +275,7 @@ jobs:
         cmake -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+          -DDFLASH27B_USER_CUDA_ARCHITECTURES="${{ env.CUDA_ARCHES }}" \
           -DCMAKE_CUDA_ARCHITECTURES="${{ env.CUDA_ARCHES }}" \
           -DDFLASH27B_ENABLE_BSA=OFF \
           -DDFLASH27B_FA_ALL_QUANTS=OFF
@@ -191,20 +286,38 @@ jobs:
       working-directory: lucebox/server/build
       run: ctest --output-on-failure -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer" --no-tests=error
 
+    - name: Stage distribution
+      # Executables and ggml shared libs land flat in server/build/ (see job
+      # header comment); collect them into a portable dist/ tree.
+      run: |
+        set -euo pipefail
+        build_dir="lucebox/server/build"
+        mkdir -p dist/bin/share
+        cp -v "$build_dir/dflash_server" "$build_dir/test_dflash" "$build_dir/test_server_unit" dist/bin/
+        cp -v "$build_dir/share/status.html" dist/bin/share/ 2>/dev/null || true
+        find "$build_dir" -name 'libggml*.so*' -exec cp -L {} dist/bin/ \;
+        # Bundle cudart unless ggml linked it statically; harmless either way.
+        cp -L "$CUDA_PATH/lib64/libcudart.so.12" dist/bin/ 2>/dev/null || true
+        cd dist/bin
+        for f in *; do
+          [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
+        done
+
     - name: Verify CUDA binaries
       run: |
         set -euo pipefail
-        bin_dir="lucebox/server/build/bin"
+        bin_dir="dist/bin"
         ls -la "$bin_dir"
         for b in test_dflash dflash_server test_server_unit; do
-          test -x "$bin_dir/$b" || { echo "ERROR: $b not built" >&2; exit 1; }
+          test -x "$bin_dir/$b" || { echo "ERROR: $b not staged" >&2; exit 1; }
         done
         help_out=$("$bin_dir/dflash_server" --help 2>&1 || true)
         echo "$help_out" | head -n 10
+        # Usage goes to stderr
         echo "$help_out" | grep -q "Usage:" || { echo "ERROR: usage output missing" >&2; exit 1; }
-        # ldd audit: every NEEDED must resolve (system or bundled)
+        # ldd audit: every NEEDED must resolve (system, bundled, or driver stub)
         for b in test_dflash dflash_server test_server_unit; do
-          unresolved=$(ldd "$bin_dir/$b" | grep "not found" || true)
+          unresolved=$(LD_LIBRARY_PATH="$RUNNER_TEMP/cuda-stubs:${LD_LIBRARY_PATH:-}" ldd "$bin_dir/$b" | grep "not found" || true)
           if [ -n "$unresolved" ]; then
             echo "ERROR: unresolved libs for $b:" >&2
             echo "$unresolved" >&2
@@ -218,20 +331,20 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: lucebox-linux-cuda12-x64
-        path: lucebox/server/build/bin/
+        path: dist/
         retention-days: 30
-
-    - name: Set job outputs
-      id: set-outputs
-      run: |
-        echo "cuda_version=12.8.0" >> "$GITHUB_OUTPUT"
-        echo "lucebox_commit_hash=${LUCEBOX_COMMIT_HASH}" >> "$GITHUB_OUTPUT"
 
     - name: Clean up workspace
       if: always()
       run: |
+        rm -rf dist
         if [ -d "lucebox" ]; then rm -rf lucebox; fi
 
+  # ──────────────────────────────────────────────────────────────────────
+  # build-rocm: one job per gfx chip. Toolchain comes from the TheRock dist
+  # mapped by prepare-matrix (family dist for RDNA3/RDMA4, single-chip for
+  # gfx115x) while the compile target stays the single requested chip.
+  # ──────────────────────────────────────────────────────────────────────
   build-rocm:
     name: build-rocm (${{ matrix.gfx_target }})
     runs-on: ubuntu-22.04
@@ -241,9 +354,6 @@ jobs:
     strategy:
       matrix: ${{ fromJSON(needs.prepare-matrix.outputs.rocm_matrix) }}
       fail-fast: false
-    outputs:
-      rocm_version: ${{ steps.set-outputs.outputs.rocm_version }}
-      lucebox_commit_hash: ${{ steps.set-outputs.outputs.lucebox_commit_hash }}
 
     steps:
     - name: Checkout repository
@@ -262,48 +372,18 @@ jobs:
     - name: Download and extract ROCm directly to /opt/rocm
       run: |
         set -euo pipefail
-        rocm_version="${{ env.ROCM_VERSION }}"
-        current_target="${{ matrix.gfx_target }}"
-
-        # Plain per-target tarball (no family alias): we ship single-gfx binaries,
-        # and the alias tarballs pull kernels for sibling chips for no benefit.
-        s3_target="$current_target"
-
         base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
-        if [ "$rocm_version" = "latest" ]; then
-          echo "Auto-detecting latest ROCm version for $current_target"
-          prefix="therock-dist-linux-${s3_target}-"
-
-          files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
-          if [ -z "$files_json" ]; then
-            echo "Failed to parse file index from $base_url/" >&2
-            exit 1
-          fi
-
-          latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" \
-            '[.[] | select(.name | test("^" + $p + "[0-9]+\\.[0-9]+\\.[0-9]+(a|rc)[0-9]+\\.tar\\.gz$"))] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
-          if [ -z "$latest_file" ]; then
-            echo "No tarball found for prefix '$prefix' at $base_url/" >&2
-            exit 1
-          fi
-          echo "Found latest file: $latest_file"
-
-          if [[ "$latest_file" =~ therock-dist-linux-${s3_target}-([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
-            rocm_version="${BASH_REMATCH[1]}"
-            echo "Detected latest ROCm version: $rocm_version"
-          else
-            echo "Failed to extract ROCm version from: $latest_file" >&2
-            exit 1
-          fi
-
-          rocm_url="$base_url/$latest_file"
+        s3_target="${{ matrix.s3_target }}"
+        if [ "${{ env.ROCM_VERSION }}" = "latest" ]; then
+          rocm_version=$(jq -r --arg p "$s3_target" '.[$p]' <<<'${{ needs.prepare-matrix.outputs.versions_json }}')
         else
-          rocm_url="$base_url/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+          rocm_version="${{ env.ROCM_VERSION }}"
         fi
-
+        rocm_url="$base_url/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+        echo "Downloading $rocm_url"
         echo "DETECTED_ROCM_VERSION=$rocm_version" >> "$GITHUB_ENV"
         sudo mkdir -p /opt/rocm
-        curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+        curl -sfL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
 
     - name: Set ROCm environment variables
       run: |
@@ -321,8 +401,9 @@ jobs:
         echo "PKG_CONFIG_PATH=/opt/rocm/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
     - name: Probe optional rocWMMA headers
-      # DFLASH27B_HIP_SM80_EQUIV=ON needs rocwmma headers; apt ships them via
-      # rocwmma-dev, TheRock dists may not. Fail fast with a clear message.
+      # DFLASH27B_HIP_SM80_EQUIV=ON needs rocwmma headers. Verified present in
+      # current TheRock dists, but keep the cheap fail-fast in case AMD drops
+      # them from a future nightly.
       if: env.HIP_SM80_EQUIV == 'ON'
       run: |
         found=0
@@ -331,7 +412,7 @@ jobs:
         done
         if [ "$found" = "0" ]; then
           echo "ERROR: hip_sm80_equiv requested but the ROCm dist at /opt/rocm has no rocwmma headers." >&2
-          echo "Use a ROCm version that bundles rocwmma, or rebuild locally per docs/manual_instructions.md (apt install rocwmma-dev)." >&2
+          echo "Pin an older/newer ROCm via the rocm_version dispatch input, or rebuild locally per docs/manual_instructions.md." >&2
           exit 1
         fi
 
@@ -345,8 +426,6 @@ jobs:
           git clone --depth 1 --single-branch --branch "$version" "${{ env.LUCEBOX_REPO_URL }}.git"
         fi
         cd lucebox
-        commit_hash=$(git rev-parse --short=7 HEAD)
-        echo "LUCEBOX_COMMIT_HASH=$commit_hash" >> "$GITHUB_ENV"
         git log --oneline -1
         # No Block-Sparse-Attention submodule init needed: BSA is OFF for these builds.
         test -f server/deps/llama.cpp/ggml/CMakeLists.txt \
@@ -374,61 +453,61 @@ jobs:
       working-directory: lucebox/server/build
       run: ctest --output-on-failure -R "server_unit|deepseek4_unit|feature_gate|seq_slot_manager|seq_engine_contract|seq_batch_plan|client_send_buffer" --no-tests=error
 
-    - name: Bundle ROCm runtime libraries
+    - name: Stage distribution
+      # Portable layout:
+      #   dist/bin/           binaries + ggml libs + bundled ROCm runtime libs
+      #   dist/bin/rocblas/library/   rocblas kernel tree (resolved relative
+      #                       to the loading librocblas.so's directory)
+      #   dist/kpacks/        per-gfx rocm_kpack packs; renamed to .kpack/
+      #                       (sibling of bin/) at zip time because
+      #                       upload-artifact drops hidden directories
       run: |
         set -euo pipefail
-        bin_path="lucebox/server/build/bin"
-
-        # rocblas kernel library tree (target-specific after a per-gfx dist install)
-        rocblas_lib_path="/opt/rocm/lib/rocblas/library"
-        if [ -d "$rocblas_lib_path" ]; then
-          dest_rocblas_path="$bin_path/rocblas/library"
-          mkdir -p "$(dirname "$dest_rocblas_path")"
-          cp -r "$rocblas_lib_path" "$(dirname "$dest_rocblas_path")/"
-        fi
+        gfx="${{ matrix.gfx_target }}"
+        build_dir="lucebox/server/build"
+        mkdir -p dist/bin/share dist/bin/rocblas/library dist/kpacks
+        cp -v "$build_dir/dflash_server" "$build_dir/test_dflash" "$build_dir/test_server_unit" dist/bin/
+        cp -v "$build_dir/share/status.html" dist/bin/share/ 2>/dev/null || true
+        find "$build_dir" -name 'libggml*.so*' -exec cp -L {} dist/bin/ \;
 
         # Lean runtime list: ggml's HIP path uses hipblas -> rocblas plus the
         # HIP runtime and HSA. No hipBLASLt/rocsolver/LLVM needed.
-        cp -v /opt/rocm/lib/libhipblas.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/librocblas.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/libamdhip64.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/libhsa-runtime64.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/libamd_comgr.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/libamd_comgr_loader.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/librocprofiler-register.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_numa.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so* "$bin_path/" 2>/dev/null || true
-        cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so* "$bin_path/" 2>/dev/null || true
+        cp -L /opt/rocm/lib/libhipblas.so* dist/bin/ 2>/dev/null || true
+        cp -L /opt/rocm/lib/librocblas.so* dist/bin/ 2>/dev/null || true
+        cp -L /opt/rocm/lib/libamdhip64.so* dist/bin/ 2>/dev/null || true
+        cp -L /opt/rocm/lib/libhsa-runtime64.so* dist/bin/ 2>/dev/null || true
+        cp -L /opt/rocm/lib/libamd_comgr*.so* dist/bin/ 2>/dev/null || true
+        cp -L /opt/rocm/lib/librocprofiler-register.so* dist/bin/ 2>/dev/null || true
+        cp -L /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_*.so* dist/bin/ 2>/dev/null || true
+
+        # rocblas kernel library tree. Family dists carry kernels for sibling
+        # chips (e.g. gfx1200+gfx1201); left intact for simplicity — the
+        # loader only reads the ones matching the host GPU.
+        cp -r /opt/rocm/lib/rocblas/library/. dist/bin/rocblas/library/ 2>/dev/null || true
+
+        # Per-gfx kernel packs for libraries that ship split code objects.
+        cp -v /opt/rocm/.kpack/*_${gfx}.kpack dist/kpacks/ 2>/dev/null || true
 
         # Catch-all probe loop: run dflash_server and copy whatever else the
         # loader complains about until it loads cleanly.
-        python3 utils/gather_required_libs.py --rocm-dir /opt/rocm --dest-dir "$bin_path" --binary dflash_server || true
+        python3 utils/gather_required_libs.py --rocm-dir /opt/rocm --dest-dir dist/bin --binary dflash_server || true
 
-    - name: Set RPATH for portable distribution
-      run: |
-        cd lucebox/server/build/bin
-        # Set RPATH to $ORIGIN so all libraries find adjacent dependencies locally
-        for file in *.so* test_dflash dflash_server test_server_unit; do
-          [ -f "$file" ] && [ ! -L "$file" ] && patchelf --set-rpath '$ORIGIN' "$file" 2>/dev/null || true
+        cd dist/bin
+        for f in *; do
+          [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
         done
 
     - name: Verify HIP binaries
       run: |
         set -euo pipefail
-        bin_dir="lucebox/server/build/bin"
-        LD_LIBRARY_PATH="$(pwd)/$bin_dir:${LD_LIBRARY_PATH:-}"
-        export LD_LIBRARY_PATH
+        bin_dir="dist/bin"
         ls -la "$bin_dir"
         for b in test_dflash dflash_server test_server_unit; do
-          test -x "$bin_dir/$b" || { echo "ERROR: $b not built" >&2; exit 1; }
+          test -x "$bin_dir/$b" || { echo "ERROR: $b not staged" >&2; exit 1; }
         done
         help_out=$("$bin_dir/dflash_server" --help 2>&1 || true)
         echo "$help_out" | head -n 10
+        # Usage goes to stderr
         echo "$help_out" | grep -q "Usage:" || { echo "ERROR: usage output missing" >&2; exit 1; }
         for b in test_dflash dflash_server test_server_unit; do
           unresolved=$(ldd "$bin_dir/$b" | grep "not found" || true)
@@ -440,34 +519,28 @@ jobs:
         done
         echo "HIP binary verification successful! (${{ matrix.gfx_target }})"
 
-    - name: Upload build artifacts
-      id: upload-artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: lucebox-linux-rocm-${{ matrix.gfx_target }}-x64
-        path: lucebox/server/build/bin/
-        retention-days: 30
-
-    - name: Set job outputs
-      id: set-outputs
-      run: |
-        rocm_version="${DETECTED_ROCM_VERSION:-${{ env.ROCM_VERSION }}}"
-        echo "rocm_version=$rocm_version" >> "$GITHUB_OUTPUT"
-        echo "lucebox_commit_hash=${LUCEBOX_COMMIT_HASH}" >> "$GITHUB_OUTPUT"
-
     - name: Create release summary
       run: |
-        cat > "build-summary-rocm-${{ matrix.gfx_target }}.md" << 'EOF'
+        cat > "build-summary-rocm-${{ matrix.gfx_target }}.md" << EOF
         # lucebox Build Summary (ROCm - ${{ matrix.gfx_target }})
 
         ## Build Configuration
         - **GPU Target**: ${{ matrix.gfx_target }}
         - **Backend**: HIP
-        - **ROCm Version**: ${{ env.DETECTED_ROCM_VERSION || env.ROCM_VERSION }}
-        - **lucebox Commit Hash**: ${{ env.LUCEBOX_COMMIT_HASH }}
+        - **TheRock Dist Prefix**: ${{ matrix.s3_target }}
+        - **ROCm Version**: ${DETECTED_ROCM_VERSION}
+        - **lucebox Commit Hash**: ${{ needs.prepare-matrix.outputs.lucebox_commit_hash }}
         - **HIP SM80 Equiv (rocWMMA)**: ${{ env.HIP_SM80_EQUIV }}
         - **Build Type**: Release
         EOF
+
+    - name: Upload build artifacts
+      id: upload-artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: lucebox-linux-rocm-${{ matrix.gfx_target }}-x64
+        path: dist/
+        retention-days: 30
 
     - name: Upload build summary
       uses: actions/upload-artifact@v4
@@ -479,29 +552,29 @@ jobs:
     - name: Clean up workspace
       if: always()
       run: |
-        if [ -f "rocm.tar.gz" ]; then rm -f rocm.tar.gz; fi
+        rm -rf dist
         if [ -d "/opt/rocm" ]; then sudo rm -rf /opt/rocm; fi
         if [ -d "lucebox" ]; then rm -rf lucebox; fi
 
+  # ──────────────────────────────────────────────────────────────────────
+  # smoke-test: non-blocking GPU checks on self-hosted runners. The matrix
+  # comes from prepare-matrix and contains ONLY targets with a configured
+  # runner-label repo variable, so unconfigured targets never queue.
+  # continue-on-error keeps hardware flakiness from blocking releases.
+  # ──────────────────────────────────────────────────────────────────────
   smoke-test:
     name: smoke-test (${{ matrix.gfx_target }})
     runs-on: ${{ fromJSON(matrix.runner_labels) }}
     continue-on-error: true
-    timeout-minutes: 15
+    timeout-minutes: 20
     needs: [prepare-matrix, build-cuda, build-rocm]
     strategy:
-      matrix:
-        include:
-          - gfx_target: gfx1151
-            runner_labels: ${{ vars.LUCEBOX_RUNNERS_GFX1151 || '["nonexistent-runner-skip"]' }}
-          - gfx_target: gfx1201
-            runner_labels: ${{ vars.LUCEBOX_RUNNERS_GFX1201 || '["nonexistent-runner-skip"]' }}
-          - gfx_target: gfx1100
-            runner_labels: ${{ vars.LUCEBOX_RUNNERS_GFX1100 || '["nonexistent-runner-skip"]' }}
+      matrix: ${{ fromJSON(needs.prepare-matrix.outputs.smoke_matrix) }}
       fail-fast: false
     if: |
       always() &&
       needs.prepare-matrix.result == 'success' &&
+      needs.prepare-matrix.outputs.smoke_matrix != '[]' &&
       contains(fromJSON('["success","skipped"]'), needs.build-cuda.result) &&
       contains(fromJSON('["success","skipped"]'), needs.build-rocm.result) &&
       github.event_name != 'pull_request'
@@ -514,14 +587,13 @@ jobs:
       uses: ./.github/actions/smoke-test-lucebox
       with:
         gfx_target: ${{ matrix.gfx_target }}
-        artifact_name: lucebox-linux-rocm-${{ matrix.gfx_target }}-x64
+        artifact_name: ${{ matrix.gfx_target == 'cuda' && 'lucebox-linux-cuda12-x64' || format('lucebox-linux-rocm-{0}-x64', matrix.gfx_target) }}
 
   create-release:
     needs: [prepare-matrix, build-cuda, build-rocm]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-      pull-requests: write
     if: |
       always() &&
       (needs.build-cuda.result == 'success' || needs.build-cuda.result == 'skipped') &&
@@ -585,7 +657,7 @@ jobs:
         if [ -d "$artifact_dir" ]; then
           cd "$artifact_dir"
           zip -r "../../${final_archive_name}.zip" .
-          cd ../../..
+          cd - > /dev/null
         else
           echo "Warning: Artifact directory not found: $artifact_dir"
         fi
@@ -599,8 +671,15 @@ jobs:
           final_archive_name="lucebox-${TAG}-linux-rocm-${target}-x64"
           if [ -d "$artifact_dir" ]; then
             cd "$artifact_dir"
+            # Restore hidden-dir geometry BEFORE zipping: rocm_kpack resolves
+            # "../.kpack/<name>_<gfx>.kpack" relative to each loading library
+            # in bin/, so .kpack must sit beside bin/. upload-artifact dropped
+            # the leading dot, hence the rename here; shopt -s dotglob makes
+            # zip pick the renamed hidden dir up.
+            shopt -s dotglob
+            [ -d kpacks ] && mv kpacks .kpack
             zip -r "../../${final_archive_name}.zip" .
-            cd ../../..
+            cd - > /dev/null
           else
             echo "Warning: Artifact directory not found: $artifact_dir"
           fi
@@ -610,11 +689,13 @@ jobs:
       if: steps.check-tag.outputs.tag_exists == 'false'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        VERSIONS_JSON: ${{ needs.prepare-matrix.outputs.versions_json }}
+        LUCEBOX_COMMIT_HASH: ${{ needs.prepare-matrix.outputs.lucebox_commit_hash }}
       run: |
         TAG="${{ steps.generate-tag.outputs.tag }}"
-        ROCM_VERSION="${{ needs.build-rocm.outputs.rocm_version }}"
-        LUCEBOX_COMMIT_HASH="${{ needs.build-cuda.outputs.lucebox_commit_hash || needs.build-rocm.outputs.lucebox_commit_hash }}"
         targets="${{ env.GFX_TARGETS }}"
+
+        rocm_versions=$(echo "$VERSIONS_JSON" | jq -r 'to_entries | map("- " + .key + ": " + .value) | join(", ")')
 
         upload_files=""
         final_archive_name="lucebox-${TAG}-linux-cuda12-x64"
@@ -630,7 +711,7 @@ jobs:
           --title "lucebox $TAG" \
           --notes "**Build Number**: $TAG
         **GPU Target(s)**: cuda12 (fat binary sm_${{ env.CUDA_ARCHES }}), $targets (HIP)
-        **ROCm Version**: ${ROCM_VERSION:-n/a}
+        **ROCm Version** (TheRock prefix: version): ${rocm_versions:-n/a}
         **CUDA Version**: 12.8.0
         **lucebox Commit Hash**: $LUCEBOX_COMMIT_HASH
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
